@@ -28,10 +28,11 @@ jobs:
           import urllib.parse
           from pathlib import Path
 
-          API_URL = "https://webapi.yanoshin.jp/webapi/tdnet/list/6040.json2?limit=20"
+          API_URL = "https://webapi.yanoshin.jp/webapi/tdnet/list/recent.json2?limit=300"
           STATE_FILE = Path("last_seen.txt")
           NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 
+          # TDnet最新300件を取得
           req = urllib.request.Request(
               API_URL,
               headers={"User-Agent": "tdnet-6040-monitor/1.0"}
@@ -43,15 +44,22 @@ jobs:
           items = data.get("items", [])
 
           if not items:
-              print("TDnet情報が取得できませんでした。")
+              print("TDnet情報を取得できませんでした。")
               raise SystemExit(1)
 
+          # 6040だけ抽出
           disclosures = []
 
           for item in items:
               tdnet = item.get("Tdnet", item)
 
               if not tdnet:
+                  continue
+
+              code = str(tdnet.get("code", ""))
+
+              # 証券コード6040のみ
+              if not code.startswith("6040"):
                   continue
 
               disclosures.append({
@@ -62,17 +70,18 @@ jobs:
                   "url": tdnet.get("document_url", "")
               })
 
-          disclosures = [x for x in disclosures if x["id"]]
-
           if not disclosures:
-              print("開示情報を取得できませんでした。")
-              raise SystemExit(1)
+              print("最新300件の中に6040の開示はありません。")
+              raise SystemExit(0)
+
+          print("6040の最新開示:")
+          for item in disclosures[:5]:
+              print(item)
 
           latest = disclosures[0]
 
-          print("最新開示:")
-          print(latest)
-
+          # 初回実行
+          # 現在の最新開示を記録するだけ
           if not STATE_FILE.exists():
               STATE_FILE.write_text(latest["id"], encoding="utf-8")
               print("初回実行：現在の最新開示を記録しました。")
@@ -80,6 +89,7 @@ jobs:
 
           last_seen = STATE_FILE.read_text(encoding="utf-8").strip()
 
+          # 前回以降の新しい開示を探す
           new_items = []
 
           for item in disclosures:
@@ -88,12 +98,14 @@ jobs:
               new_items.append(item)
 
           if not new_items:
-              print("新しい開示はありません。")
+              print("新しい6040の開示はありません。")
               raise SystemExit(0)
 
+          # 古いものから順番に通知
           new_items.reverse()
 
           for item in new_items:
+
               message = (
                   f"日本スキー場開発（6040）\n"
                   f"{item['pubdate']}\n\n"
@@ -101,7 +113,10 @@ jobs:
                   f"{item['url']}"
               )
 
-              encoded_topic = urllib.parse.quote(NTFY_TOPIC, safe="")
+              encoded_topic = urllib.parse.quote(
+                  NTFY_TOPIC,
+                  safe=""
+              )
 
               notify_req = urllib.request.Request(
                   f"https://ntfy.sh/{encoded_topic}",
@@ -114,10 +129,20 @@ jobs:
                   }
               )
 
-              with urllib.request.urlopen(notify_req, timeout=30) as response:
+              with urllib.request.urlopen(
+                  notify_req,
+                  timeout=30
+              ) as response:
                   print("通知送信:", response.status)
 
-          STATE_FILE.write_text(latest["id"], encoding="utf-8")
+          # 最新の開示IDを保存
+          STATE_FILE.write_text(
+              latest["id"],
+              encoding="utf-8"
+          )
+
+          print("監視状態を更新しました。")
+
           PY
 
       - name: Save state
