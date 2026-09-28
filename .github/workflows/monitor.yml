@@ -1,19 +1,135 @@
 name: TDnet 6040 Monitor
 
 on:
+  schedule:
+    - cron: "2-59/5 * * * 1-5"
+      timezone: "Asia/Tokyo"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  test-notification:
+  monitor:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Send test notification
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check TDnet
+        env:
+          NTFY_TOPIC: tdnet6040-7kq9m2x8p4
         run: |
-          curl \
-            -X POST \
-            -H "Title: 日本スキー場開発 TDnet" \
-            -H "Priority: high" \
-            -H "Tags: newspaper" \
-            -d "テスト通知です。GitHub Actionsからの通知に成功しました。" \
-            https://ntfy.sh/tdnet6040-7kq9m2x8p4
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+          import urllib.parse
+          from pathlib import Path
+
+          API_URL = "https://webapi.yanoshin.jp/webapi/tdnet/list/6040.json2?limit=20"
+          STATE_FILE = Path("last_seen.txt")
+          NTFY_TOPIC = os.environ["NTFY_TOPIC"]
+
+          req = urllib.request.Request(
+              API_URL,
+              headers={"User-Agent": "tdnet-6040-monitor/1.0"}
+          )
+
+          with urllib.request.urlopen(req, timeout=30) as response:
+              data = json.loads(response.read().decode("utf-8"))
+
+          items = data.get("items", [])
+
+          if not items:
+              print("TDnet情報が取得できませんでした。")
+              raise SystemExit(1)
+
+          disclosures = []
+
+          for item in items:
+              tdnet = item.get("Tdnet", item)
+
+              if not tdnet:
+                  continue
+
+              disclosures.append({
+                  "id": str(tdnet.get("id", "")),
+                  "pubdate": tdnet.get("pubdate", ""),
+                  "company_name": tdnet.get("company_name", ""),
+                  "title": tdnet.get("title", ""),
+                  "url": tdnet.get("document_url", "")
+              })
+
+          disclosures = [x for x in disclosures if x["id"]]
+
+          if not disclosures:
+              print("開示情報を取得できませんでした。")
+              raise SystemExit(1)
+
+          latest = disclosures[0]
+
+          print("最新開示:")
+          print(latest)
+
+          if not STATE_FILE.exists():
+              STATE_FILE.write_text(latest["id"], encoding="utf-8")
+              print("初回実行：現在の最新開示を記録しました。")
+              raise SystemExit(0)
+
+          last_seen = STATE_FILE.read_text(encoding="utf-8").strip()
+
+          new_items = []
+
+          for item in disclosures:
+              if item["id"] == last_seen:
+                  break
+              new_items.append(item)
+
+          if not new_items:
+              print("新しい開示はありません。")
+              raise SystemExit(0)
+
+          new_items.reverse()
+
+          for item in new_items:
+              message = (
+                  f"日本スキー場開発（6040）\n"
+                  f"{item['pubdate']}\n\n"
+                  f"{item['title']}\n\n"
+                  f"{item['url']}"
+              )
+
+              encoded_topic = urllib.parse.quote(NTFY_TOPIC, safe="")
+
+              notify_req = urllib.request.Request(
+                  f"https://ntfy.sh/{encoded_topic}",
+                  data=message.encode("utf-8"),
+                  method="POST",
+                  headers={
+                      "Title": "日本スキー場開発（6040）TDnet",
+                      "Priority": "high",
+                      "Tags": "newspaper"
+                  }
+              )
+
+              with urllib.request.urlopen(notify_req, timeout=30) as response:
+                  print("通知送信:", response.status)
+
+          STATE_FILE.write_text(latest["id"], encoding="utf-8")
+          PY
+
+      - name: Save state
+        run: |
+          if git diff --quiet -- last_seen.txt; then
+            echo "状態に変更なし"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add last_seen.txt
+          git commit -m "Update TDnet monitoring state"
+          git push
