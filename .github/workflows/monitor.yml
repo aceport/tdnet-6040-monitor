@@ -17,105 +17,247 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check TDnet
+      - name: Check Yahoo Finance disclosure
         env:
           NTFY_TOPIC: tdnet6040-7kq9m2x8p4
         run: |
           python - <<'PY'
+          import html
           import json
           import os
-          import urllib.request
+          import re
           import urllib.parse
+          import urllib.request
+          from html.parser import HTMLParser
           from pathlib import Path
 
-          API_URL = "https://webapi.yanoshin.jp/webapi/tdnet/list/recent.json2?limit=300"
-          STATE_FILE = Path("last_seen.txt")
+          URL = "https://finance.yahoo.co.jp/quote/6040.T/disclosure"
+          STATE_FILE = Path("seen_disclosures.json")
           NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 
-          # TDnet最新300件を取得
+          # ----------------------------------------
+          # Yahoo!ファイナンスのページを取得
+          # ----------------------------------------
           req = urllib.request.Request(
-              API_URL,
-              headers={"User-Agent": "tdnet-6040-monitor/1.0"}
+              URL,
+              headers={
+                  "User-Agent": (
+                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 Chrome/140 Safari/537.36"
+                  )
+              }
           )
 
           with urllib.request.urlopen(req, timeout=30) as response:
-              data = json.loads(response.read().decode("utf-8"))
+              page = response.read().decode("utf-8", errors="ignore")
 
-          items = data.get("items", [])
+          # ----------------------------------------
+          # リンクを取得
+          # ----------------------------------------
+          class LinkParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.links = []
+                  self.current_href = None
+                  self.current_text = []
 
-          if not items:
-              print("TDnet情報を取得できませんでした。")
-              raise SystemExit(1)
+              def handle_starttag(self, tag, attrs):
+                  if tag == "a":
+                      attrs = dict(attrs)
+                      self.current_href = attrs.get("href")
+                      self.current_text = []
 
-          # 6040だけ抽出
+              def handle_data(self, data):
+                  if self.current_href is not None:
+                      self.current_text.append(data)
+
+              def handle_endtag(self, tag):
+                  if tag == "a" and self.current_href is not None:
+                      text = "".join(self.current_text).strip()
+                      if text:
+                          self.links.append(
+                              (self.current_href, text)
+                          )
+                      self.current_href = None
+                      self.current_text = []
+
+          parser = LinkParser()
+          parser.feed(page)
+
+          # ----------------------------------------
+          # 適時開示PDFだけを抽出
+          # ----------------------------------------
           disclosures = []
 
-          for item in items:
-              tdnet = item.get("Tdnet", item)
+          for href, text in parser.links:
 
-              if not tdnet:
+              if "TDnet PDF" not in text:
                   continue
 
-              code = str(tdnet.get("code", ""))
-
-              # 証券コード6040のみ
-              if not code.startswith("6040"):
+              if not href:
                   continue
+
+              # PDF URLを絶対URLにする
+              href = urllib.parse.urljoin(URL, href)
+
+              # 表示テキストを整形
+              text = html.unescape(text)
+              text = re.sub(r"\s+", " ", text).strip()
+
+              # 「TDnet PDF(...)」以降を削除
+              title_text = re.sub(
+                  r"TDnet PDF.*$",
+                  "",
+                  text
+              ).strip()
+
+              # 日付・時刻を除去
+              title_text = re.sub(
+                  r"\d{4}/\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}$",
+                  "",
+                  title_text
+              ).strip()
+
+              title_text = re.sub(
+                  r"\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}$",
+                  "",
+                  title_text
+              ).strip()
+
+              # 余分な記号を削除
+              title_text = title_text.strip(" |")
+
+              # PDF URLをIDとして使用
+              item_id = href
 
               disclosures.append({
-                  "id": str(tdnet.get("id", "")),
-                  "pubdate": tdnet.get("pubdate", ""),
-                  "company_name": tdnet.get("company_name", ""),
-                  "title": tdnet.get("title", ""),
-                  "url": tdnet.get("document_url", "")
+                  "id": item_id,
+                  "title": title_text,
+                  "url": href,
+                  "raw": text
               })
 
-          if not disclosures:
-              print("最新300件の中に6040の開示はありません。")
-              raise SystemExit(0)
-
-          print("6040の最新開示:")
-          for item in disclosures[:5]:
-              print(item)
-
-          latest = disclosures[0]
-
-          # 初回実行
-          # 現在の最新開示を記録するだけ
-          if not STATE_FILE.exists():
-              STATE_FILE.write_text(latest["id"], encoding="utf-8")
-              print("初回実行：現在の最新開示を記録しました。")
-              raise SystemExit(0)
-
-          last_seen = STATE_FILE.read_text(encoding="utf-8").strip()
-
-          # 前回以降の新しい開示を探す
-          new_items = []
-
+          # 重複削除
+          unique = {}
           for item in disclosures:
-              if item["id"] == last_seen:
-                  break
-              new_items.append(item)
+              unique[item["id"]] = item
 
-          if not new_items:
-              print("新しい6040の開示はありません。")
-              raise SystemExit(0)
+          disclosures = list(unique.values())
 
-          # 古いものから順番に通知
-          new_items.reverse()
+          if not disclosures:
+              print("Yahoo!ファイナンスから適時開示を取得できませんでした。")
+              raise SystemExit(1)
 
-          for item in new_items:
+          print(f"取得した開示件数: {len(disclosures)}")
 
-              message = (
-                  f"日本スキー場開発（6040）\n"
-                  f"{item['pubdate']}\n\n"
-                  f"{item['title']}\n\n"
-                  f"{item['url']}"
+          print("")
+          print("最新の開示:")
+          for item in disclosures[:10]:
+              print(item["title"])
+              print(item["url"])
+              print("")
+
+          # ----------------------------------------
+          # 初回実行
+          # ----------------------------------------
+          if not STATE_FILE.exists():
+
+              # 現在表示されている開示を全部既読として登録
+              state = {
+                  "seen": [x["id"] for x in disclosures]
+              }
+
+              STATE_FILE.write_text(
+                  json.dumps(
+                      state,
+                      ensure_ascii=False,
+                      indent=2
+                  ),
+                  encoding="utf-8"
               )
 
-              encoded_topic = urllib.parse.quote(
-                  NTFY_TOPIC,
-                  safe=""
+              print("初回実行：現在の開示を既読として登録しました。")
+              print("過去の開示は通知しません。")
+
+              raise SystemExit(0)
+
+          # ----------------------------------------
+          # 前回までに見た開示
+          # ----------------------------------------
+          try:
+              state = json.loads(
+                  STATE_FILE.read_text(
+                      encoding="utf-8"
+                  )
+              )
+
+              seen = set(state.get("seen", []))
+
+          except Exception:
+              seen = set()
+
+          # 新着
+          new_items = [
+              item
+              for item in disclosures
+              if item["id"] not in seen
+          ]
+
+          if not new_items:
+              print("新しい開示はありません。")
+              raise SystemExit(0)
+
+          print(f"新しい開示: {len(new_items)}件")
+
+          # ----------------------------------------
+          # 優待関連キーワード
+          # ----------------------------------------
+          priority_keywords = [
+              "株主優待",
+              "優待",
+              "廃止",
+              "変更",
+              "終了",
+              "中止",
+              "改悪",
+              "縮小",
+              "拡充",
+              "新設"
+          ]
+
+          # ----------------------------------------
+          # 新着通知
+          # ----------------------------------------
+          encoded_topic = urllib.parse.quote(
+              NTFY_TOPIC,
+              safe=""
+          )
+
+          for item in reversed(new_items):
+
+              title = item["title"]
+
+              is_priority = any(
+                  keyword in title
+                  for keyword in priority_keywords
+              )
+
+              if is_priority:
+                  notification_title = (
+                      "🚨 日本スキー場開発（6040）優待関連"
+                  )
+                  priority = "urgent"
+                  tags = "rotating_light,newspaper"
+              else:
+                  notification_title = (
+                      "日本スキー場開発（6040）TDnet"
+                  )
+                  priority = "default"
+                  tags = "newspaper"
+
+              message = (
+                  f"{title}\n\n"
+                  f"{item['url']}"
               )
 
               notify_req = urllib.request.Request(
@@ -123,9 +265,9 @@ jobs:
                   data=message.encode("utf-8"),
                   method="POST",
                   headers={
-                      "Title": "日本スキー場開発（6040）TDnet",
-                      "Priority": "high",
-                      "Tags": "newspaper"
+                      "Title": notification_title,
+                      "Priority": priority,
+                      "Tags": tags
                   }
               )
 
@@ -133,11 +275,34 @@ jobs:
                   notify_req,
                   timeout=30
               ) as response:
-                  print("通知送信:", response.status)
 
-          # 最新の開示IDを保存
+                  print(
+                      f"通知送信: {title} "
+                      f"(HTTP {response.status})"
+                  )
+
+          # ----------------------------------------
+          # 既読情報を保存
+          # ----------------------------------------
+          all_seen = list(seen)
+
+          for item in disclosures:
+              if item["id"] not in all_seen:
+                  all_seen.append(item["id"])
+
+          # 古いものを無限に保存しない
+          all_seen = all_seen[-200:]
+
+          state = {
+              "seen": all_seen
+          }
+
           STATE_FILE.write_text(
-              latest["id"],
+              json.dumps(
+                  state,
+                  ensure_ascii=False,
+                  indent=2
+              ),
               encoding="utf-8"
           )
 
@@ -147,7 +312,7 @@ jobs:
 
       - name: Save state
         run: |
-          if git diff --quiet -- last_seen.txt; then
+          if git diff --quiet -- seen_disclosures.json; then
             echo "状態に変更なし"
             exit 0
           fi
@@ -155,6 +320,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add last_seen.txt
-          git commit -m "Update TDnet monitoring state"
+          git add seen_disclosures.json
+          git commit -m "Update TDnet disclosure state"
           git push
